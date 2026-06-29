@@ -1,0 +1,6 @@
+# Ignore error and output files
+*.err
+*.out
+*.pth
+*.npz
+*.csv
