@@ -35,7 +35,7 @@ from sklearn.model_selection import KFold
 from sklearn.metrics import average_precision_score
 
 from Dataloader_itf import SequenceParatopeDataset
-from Models_boundary import ClassificationModel
+from Models_fullnew import ClassificationModel
 
 
 try:
@@ -496,9 +496,9 @@ def main():
         "weight_end": 1.0,
         "weight_anneal_tau": 8.0,
 
-        "dropedge_min": 0.02,
-        "dropedge_max": 0.08,
-        "token_drop_p": 0.02,
+        "dropedge_min": 0.03,
+        "dropedge_max": 0.10,
+        "token_drop_p": 0.03,
         "smooth_lambda": 0.01,
 
         "aucpr_alpha": 0.30,

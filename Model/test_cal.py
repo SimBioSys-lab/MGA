@@ -10,7 +10,7 @@ from sklearn.metrics import (
 )
 import numpy as np
 from Dataloader_itf import SequenceParatopeDataset
-from Models_CE import ClassificationModel
+from Models_fullnew import ClassificationModel
 from torch.amp import autocast
 import csv
 import os
