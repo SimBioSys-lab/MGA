@@ -1,7 +1,0 @@
-{'sequence_file': 'para_tv_esmsequences_1600.npz', 'data_file': 'para_tv_esminterfaces_1600.npz', 'edge_file': 'para_tv_esmedges_1600.npz', 'vocab_size': 31, 'seq_len': 1600, 'embed_dim': 256, 'num_heads': 16, 'dropout': 0.1, 'num_layers': 1, 'num_gnn_layers': 10, 'num_int_layers': 5, 'drop_path_rate': 0.1, 'num_classes': 2, 'batch_size': 4, 'num_epochs': 50, 'warmup_epochs': 10, 'swa_start': 20, 'learning_rate': 0.0002, 'weight_decay': 0.0001, 'max_grad_norm': 0.5, 'accum_steps': 1, 'n_splits': 10, 'early_stop': 20, 'weight_start': 20.0, 'weight_end': 1.0, 'weight_anneal_tau': 8.0, 'dropedge_min': 0.05, 'dropedge_max': 0.15, 'token_drop_p': 0.05, 'apply_feature_mask_on_train_only': True, 'smooth_lambda': 0.05, 'smooth_ramp_start': 5, 'smooth_ramp_len': 10, 'aucpr_alpha': 0.4, 'aucpr_bins': 64, 'aucpr_temp': 0.05, 'label_smoothing': 0.05}
-Number of GPUs available: 1
-
-── Fold 1/10
-Initializing ClassificationModel with 10 GAT layers and residual connections...
-Initializing MCModel with 10 GAT layers and 5 row attention layers (drop_path_rate=0.1)
-Initializing CoreModel with 1 layers, drop_path_rate=0.1
