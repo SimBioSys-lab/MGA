@@ -12,6 +12,6 @@
 #SBATCH --mail-type=ALL
 
 module load cuda/12.8.0
-#CUDA_VISIBLE_DEVICES=0 CUDA_LAUNCH_BLOCKING=1 python Train_model.py --out_dir checkpoints_old --num_layers 1 --num_gnn_layers 6 --num_int_layers 4
-ls iPara*pth > ipara_i_files
-python  test_cal.py ipara_i_files > ipara_i.out 
+CUDA_VISIBLE_DEVICES=0 CUDA_LAUNCH_BLOCKING=1 python Train_model.py --out_dir checkpoints_boundary --num_layers 1 --num_gnn_layers 10 --num_int_layers 4
+#ls iPara*pth > ipara_i_files
+#python  test_cal.py ipara_i_files > ipara_i.out 

@@ -31,7 +31,7 @@ def _find_chain_spans_1d(tokens: torch.Tensor, eoc_id: int = 24, pad_id: int = 1
       1. reads the query row only
       2. stops at the first PAD token
       3. splits at every EOC
-      4. excludes EOC tokens from attended chain spans
+      4. excludes EOC tokens from biological residue spans
       5. supports multiple antigen chains
 
     Example:
@@ -54,8 +54,8 @@ def _find_chain_spans_1d(tokens: torch.Tensor, eoc_id: int = 24, pad_id: int = 1
     for eoc in eocs:
         eoc = int(eoc)
         if eoc > start:
-            spans.append((start, eoc))
-        start = eoc + 1
+            spans.append((start, eoc))  # exclude EOC itself
+        start = eoc + 1                 # skip EOC
 
     if start < valid_len:
         spans.append((start, valid_len))
@@ -63,50 +63,22 @@ def _find_chain_spans_1d(tokens: torch.Tensor, eoc_id: int = 24, pad_id: int = 1
     return spans
 
 
-def _build_chain_type_ids_from_spans(
-    sequences: torch.Tensor,
-    batch_spans,
-    eoc_id: int = 24,
-    pad_id: int = 1,
-):
+def _boundary_context_start(query_tokens: torch.Tensor, start: int, eoc_id: int = 24):
     """
-    Build per-position chain-type ids from query-row spans.
+    Return context start for a chain span.
 
-    ids:
-      0 = PAD / unknown
-      1 = Lchain
-      2 = Hchain
-      3 = AGchain(s)
-      4 = EOC / boundary
+    If the residue span starts immediately after an EOC token, include that EOC
+    as a left-context token for attention. For the first span, there is no
+    previous EOC, so CoreModel prepends a learned BOS/context token instead.
+    The caller should only write outputs back to residue positions [start:end],
+    not to the context position.
 
-    Returns:
-      chain_type_ids: [B, L] on same device as sequences
+    This recovers the useful boundary-token context from the old chain-split
+    behavior while avoiding treating EOC as a biological residue.
     """
-    B, S, L = sequences.shape
-    device = sequences.device
-
-    chain_type_ids = torch.zeros((B, L), dtype=torch.long, device=device)
-    query = sequences[:, 0, :].long()
-
-    # Mark EOC boundaries explicitly. PAD remains 0.
-    chain_type_ids[query == eoc_id] = 4
-
-    for b in range(B):
-        for chain_idx, (start, end) in enumerate(batch_spans[b]):
-            if end <= start:
-                continue
-
-            if chain_idx == 0:
-                cid = 1  # Lchain
-            elif chain_idx == 1:
-                cid = 2  # Hchain
-            else:
-                cid = 3  # AGchains
-
-            chain_type_ids[b, start:end] = cid
-
-    chain_type_ids[query == pad_id] = 0
-    return chain_type_ids
+    if start > 0 and int(query_tokens[start - 1].item()) == int(eoc_id):
+        return start - 1
+    return start
 
 
 class Attention(nn.Module):
@@ -260,18 +232,14 @@ class MSASelfAttentionBlock(nn.Module):
 
 class CoreModel(nn.Module):
     """
-    Old-style CoreModel with fixed chain splitting plus chain-type embedding.
+    Old-style CoreModel with fixed chain splitting plus boundary-context attention.
 
-    This ablation disables regional attention scaling by default.
+    Biological residue spans exclude EOC tokens, but if a chain starts immediately
+    after an EOC, that EOC is included as a left-context token during attention.
+    The EOC output is discarded and only residue positions are written back.
 
-    The previous combined version had two changes:
-
-      1. zero-initialized chain-type embedding
-         ids: PAD/unknown, Lchain, Hchain, AGchain, EOC
-         Zero init means the model starts exactly like the previous baseline.
-
-      2. trainable regional MSA-attention scales are kept in the code for
-         compatibility, but disabled by default in this ablation.
+    This recovers the useful boundary-token context from the old buggy split while
+    avoiding treating EOC as a predicted biological residue.
     """
     def __init__(
         self,
@@ -284,8 +252,7 @@ class CoreModel(nn.Module):
         drop_path_rate: float = 0.0,
         pad_id: int = 1,
         eoc_id: int = 24,
-        use_chain_type_emb: bool = True,
-        use_regional_attn_scale: bool = False,
+        use_boundary_context: bool = True,
     ):
         super().__init__()
 
@@ -293,14 +260,13 @@ class CoreModel(nn.Module):
 
         self.pad_id = pad_id
         self.eoc_id = eoc_id
-        self.use_chain_type_emb = use_chain_type_emb
-        self.use_regional_attn_scale = use_regional_attn_scale
-
+        self.use_boundary_context = use_boundary_context
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_id)
 
-        # 0=PAD/unknown, 1=Lchain, 2=Hchain, 3=AGchain, 4=EOC
-        self.chain_type_emb = nn.Embedding(5, embed_dim, padding_idx=0)
-        nn.init.zeros_(self.chain_type_emb.weight)
+        # Learned boundary/BOS context token used for the first chain span.
+        # For non-first chains, the real preceding EOC token is used as context.
+        # Initialized to zero so the first-span context starts neutral.
+        self.bos_context = nn.Parameter(torch.zeros(1, 1, 1, embed_dim))
 
         self.self_attention_layers = nn.ModuleList([
             MSASelfAttentionBlock(
@@ -330,7 +296,6 @@ class CoreModel(nn.Module):
         ])
 
         self.dropout = nn.Dropout(dropout)
-
         self.attn_dym = nn.ModuleList([DyM(embed_dim) for _ in range(num_layers)])
         self.ffn_dym = nn.ModuleList([DyM(embed_dim) for _ in range(num_layers)])
 
@@ -343,29 +308,6 @@ class CoreModel(nn.Module):
             DropPath(dpr[i]) if dpr[i] > 0.0 else nn.Identity()
             for i in range(num_layers)
         ])
-
-        # Regional attention branch strength, initialized to preserve current behavior.
-        self.attn_scale_l = nn.Parameter(torch.tensor(1.0))
-        self.attn_scale_h = nn.Parameter(torch.tensor(1.0))
-        self.attn_scale_ag = nn.Parameter(torch.tensor(1.0))
-
-    def _regional_scale_for_chain(self, chain_idx: int):
-        if not self.use_regional_attn_scale:
-            return 1.0
-
-        if chain_idx == 0:
-            return self.attn_scale_l
-        elif chain_idx == 1:
-            return self.attn_scale_h
-        else:
-            return self.attn_scale_ag
-
-    def get_regional_scales(self):
-        return {
-            "attn_scale_l": float(self.attn_scale_l.detach().cpu().item()),
-            "attn_scale_h": float(self.attn_scale_h.detach().cpu().item()),
-            "attn_scale_ag": float(self.attn_scale_ag.detach().cpu().item()),
-        }
 
     def forward(self, sequences):
         """
@@ -387,41 +329,68 @@ class CoreModel(nn.Module):
 
         valid_mask = sequences != self.pad_id
 
-        # Fixed: split every chain from the query row, excluding EOC tokens.
+        x = self.embedding(sequences.reshape(B * S, L))
+        x = x.reshape(B, S, L, D)
+
+        # Biological residue spans from query row, excluding EOC tokens.
         batch_spans = [
             _find_chain_spans_1d(sequences[b, 0], eoc_id=self.eoc_id, pad_id=self.pad_id)
             for b in range(B)
         ]
-
-        x = self.embedding(sequences.reshape(B * S, L))
-        x = x.reshape(B, S, L, D)
-
-        if self.use_chain_type_emb:
-            chain_type_ids = _build_chain_type_ids_from_spans(
-                sequences=sequences,
-                batch_spans=batch_spans,
-                eoc_id=self.eoc_id,
-                pad_id=self.pad_id,
-            )
-            chain_emb = self.chain_type_emb(chain_type_ids)   # [B, L, D]
-            x = x + chain_emb[:, None, :, :]                  # [B, S, L, D]
 
         for i in range(len(self.self_attention_layers)):
             res = x
             x_attn = torch.zeros_like(x)
 
             for b in range(B):
-                for chain_idx, (start, end) in enumerate(batch_spans[b]):
+                query_tokens = sequences[b, 0]
+                for start, end in batch_spans[b]:
                     if end <= start:
                         continue
 
-                    seg = x[b:b + 1, :, start:end, :]
-                    seg_mask = valid_mask[b:b + 1, :, start:end]
+                    ctx_start = start
+                    prepend_bos = False
+
+                    if self.use_boundary_context:
+                        ctx_start = _boundary_context_start(
+                            query_tokens=query_tokens,
+                            start=start,
+                            eoc_id=self.eoc_id,
+                        )
+
+                        # First biological chain has no preceding EOC.
+                        # Give it the same kind of left-context slot using a learned BOS token.
+                        if ctx_start == start:
+                            prepend_bos = True
+
+                    # Attend over optional boundary/BOS context token + residues.
+                    seg = x[b:b + 1, :, ctx_start:end, :]
+                    seg_mask = valid_mask[b:b + 1, :, ctx_start:end]
+
+                    if prepend_bos:
+                        bos = self.bos_context.expand(1, S, 1, D).to(dtype=seg.dtype, device=seg.device)
+                        seg = torch.cat([bos, seg], dim=2)
+
+                        bos_mask = torch.ones((1, S, 1), dtype=torch.bool, device=seg_mask.device)
+                        seg_mask = torch.cat([bos_mask, seg_mask], dim=2)
 
                     seg_out = self.self_attention_layers[i](seg, mask=seg_mask)
 
-                    scale = self._regional_scale_for_chain(chain_idx)
-                    x_attn[b, :, start:end, :] = scale * seg_out.squeeze(0)
+                    # If a context token was included, discard its output and
+                    # write only biological residue positions [start:end].
+                    if prepend_bos:
+                        seg_out = seg_out[:, :, 1:, :]
+                    elif ctx_start < start:
+                        seg_out = seg_out[:, :, (start - ctx_start):, :]
+
+                    if seg_out.shape[2] != (end - start):
+                        raise RuntimeError(
+                            f"Boundary-context segment length mismatch: "
+                            f"ctx_start={ctx_start}, start={start}, end={end}, "
+                            f"prepend_bos={prepend_bos}, seg_out_len={seg_out.shape[2]}"
+                        )
+
+                    x_attn[b, :, start:end, :] = seg_out.squeeze(0)
 
             x_attn = self.dropout(x_attn)
             x_attn = self.attn_dym[i](x_attn)
@@ -460,8 +429,7 @@ class CGModel(nn.Module):
         num_layers: int,
         num_gnn_layers: int,
         drop_path_rate: float = 0.0,
-        use_chain_type_emb: bool = True,
-        use_regional_attn_scale: bool = False,
+        use_boundary_context: bool = True,
     ):
         super().__init__()
 
@@ -473,8 +441,7 @@ class CGModel(nn.Module):
             dropout=dropout,
             num_layers=num_layers,
             drop_path_rate=drop_path_rate,
-            use_chain_type_emb=use_chain_type_emb,
-            use_regional_attn_scale=use_regional_attn_scale,
+            use_boundary_context=use_boundary_context,
         )
 
         self.dropout = nn.Dropout(dropout)
@@ -522,12 +489,6 @@ class CGModel(nn.Module):
         ])
 
     def _build_edge_index(self, padded_edges, seq_len, device):
-        """
-        Fixed edge filtering.
-
-        Old code often checked only src != -1. This version requires both endpoints
-        to be valid and inside [0, seq_len).
-        """
         B = padded_edges.shape[0]
         edge_indices = []
 
@@ -613,9 +574,6 @@ class CGModel(nn.Module):
 
 
 class MCModel(nn.Module):
-    """
-    Old-style MC interaction model.
-    """
     def __init__(
         self,
         vocab_size: int,
@@ -627,8 +585,7 @@ class MCModel(nn.Module):
         num_gnn_layers: int,
         num_int_layers: int,
         drop_path_rate: float = 0.0,
-        use_chain_type_emb: bool = True,
-        use_regional_attn_scale: bool = False,
+        use_boundary_context: bool = True,
     ):
         super().__init__()
 
@@ -646,8 +603,7 @@ class MCModel(nn.Module):
             num_layers=num_layers,
             num_gnn_layers=num_gnn_layers,
             drop_path_rate=drop_path_rate,
-            use_chain_type_emb=use_chain_type_emb,
-            use_regional_attn_scale=use_regional_attn_scale,
+            use_boundary_context=use_boundary_context,
         )
 
         self.row_attn_layers = nn.ModuleList([
@@ -679,7 +635,6 @@ class MCModel(nn.Module):
         ])
 
         self.dropout = nn.Dropout(dropout)
-
         self.row_dym = nn.ModuleList([DyM(embed_dim) for _ in range(num_int_layers)])
         self.ffn_dym = nn.ModuleList([DyM(embed_dim) for _ in range(num_int_layers)])
 
@@ -741,8 +696,7 @@ class ClassificationModel(nn.Module):
         num_classes,
         num_int_layers,
         drop_path_rate,
-        use_chain_type_emb: bool = True,
-        use_regional_attn_scale: bool = False,
+        use_boundary_context: bool = True,
     ):
         super().__init__()
 
@@ -758,8 +712,7 @@ class ClassificationModel(nn.Module):
             num_gnn_layers=num_gnn_layers,
             num_int_layers=num_int_layers,
             drop_path_rate=drop_path_rate,
-            use_chain_type_emb=use_chain_type_emb,
-            use_regional_attn_scale=use_regional_attn_scale,
+            use_boundary_context=use_boundary_context,
         )
 
         self.fc_classification = nn.Linear(embed_dim, num_classes)
@@ -793,8 +746,7 @@ class RegressionModel(nn.Module):
         num_int_layers,
         drop_path_rate,
         positive_output=True,
-        use_chain_type_emb: bool = True,
-        use_regional_attn_scale: bool = False,
+        use_boundary_context: bool = True,
     ):
         super().__init__()
 
@@ -810,8 +762,7 @@ class RegressionModel(nn.Module):
             num_gnn_layers=num_gnn_layers,
             num_int_layers=num_int_layers,
             drop_path_rate=drop_path_rate,
-            use_chain_type_emb=use_chain_type_emb,
-            use_regional_attn_scale=use_regional_attn_scale,
+            use_boundary_context=use_boundary_context,
         )
 
         self.fc_regression = nn.Linear(embed_dim, 1)
@@ -840,8 +791,7 @@ class CTMModel(nn.Module):
         num_classes,
         num_int_layers,
         drop_path_rate,
-        use_chain_type_emb: bool = True,
-        use_regional_attn_scale: bool = False,
+        use_boundary_context: bool = True,
     ):
         super().__init__()
 
@@ -857,8 +807,7 @@ class CTMModel(nn.Module):
             num_gnn_layers=num_gnn_layers,
             num_int_layers=num_int_layers,
             drop_path_rate=drop_path_rate,
-            use_chain_type_emb=use_chain_type_emb,
-            use_regional_attn_scale=use_regional_attn_scale,
+            use_boundary_context=use_boundary_context,
         )
 
         self.fc_linear = nn.Linear(num_heads, num_classes)

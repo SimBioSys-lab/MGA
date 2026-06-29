@@ -35,7 +35,7 @@ from sklearn.model_selection import KFold
 from sklearn.metrics import average_precision_score
 
 from Dataloader_itf import SequenceParatopeDataset
-from Models_fullnew import ClassificationModel
+from Models_boundary import ClassificationModel
 
 
 try:
