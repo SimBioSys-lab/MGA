@@ -1,0 +1,8 @@
+Traceback (most recent call last):
+  File "/projects/SimBioSys/Xing/MGA/Model/test_cal.py", line 229, in <module>
+    num_layers, num_gnn_layers, num_int_layers, dropout, drop_path_rate, num_heads = parse_model_config(model_file)
+                                                                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/projects/SimBioSys/Xing/MGA/Model/test_cal.py", line 194, in parse_model_config
+    num_layers = int(parts[1][1:])
+                 ^^^^^^^^^^^^^^^^^
+ValueError: invalid literal for int() with base 10: 'alanced'

@@ -1,0 +1,14 @@
+Device: cuda
+Visible GPUs: 1
+GPU 0: NVIDIA RTX PRO 6000 Blackwell Server Edition
+Dataset size: 858
+Config: {'sequence_file': 'para_tv_esmsequences_1600.npz', 'data_file': 'para_tv_esminterfaces_1600.npz', 'edge_file': 'para_tv_esmedges_1600.npz', 'seq_len': 1600, 'vocab_size': 31, 'num_classes': 2, 'pad_id': 1, 'eoc_id': 24, 'embed_dim': 256, 'num_heads': 16, 'num_layers': 1, 'num_gnn_layers': 8, 'num_int_layers': 5, 'dropout': 0.1, 'drop_path_rate': 0.1, 'batch_size': 4, 'num_epochs': 80, 'warmup_epochs': 10, 'min_stop_epoch': 35, 'early_stop': 18, 'learning_rate': 0.0002, 'weight_decay': 0.0001, 'max_grad_norm': 0.5, 'accum_steps': 1, 'amp': True, 'weight_start': 8.0, 'weight_end': 1.0, 'weight_anneal_tau': 10.0, 'dropedge_min': 0.01, 'dropedge_max': 0.05, 'token_drop_p': 0.01, 'smooth_lambda': 0.01, 'aucpr_alpha': 0.4, 'aucpr_ramp_start': 10, 'aucpr_ramp_len': 10, 'aucpr_bins': 64, 'aucpr_temp': 0.05, 'antibody_loss_weight': 1.0, 'antigen_loss_weight': 1.0, 'n_splits': 10}
+
+================================================================================
+Fold 1/10
+================================================================================
+Train labels: valid=448463, pos=29774, neg=418689, ignore=786737, pos_frac=0.06639
+Val labels: valid=51729, pos=3456, neg=48273, ignore=85871, pos_frac=0.06681
+Initializing ClassificationModel with 8 GAT layers and residual connections...
+Initializing MCModel with 8 GAT layers and 5 row attention layers (drop_path_rate=0.1)
+Initializing CoreModel with 1 layers, drop_path_rate=0.1

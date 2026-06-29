@@ -1,24 +1,17 @@
 #!/bin/bash
-#SBATCH -J test_pipline
-#SBATCH -o test_pipline.out
-#SBATCH -e test_pipline.err
-##SBATCH --partition=gpu-short
-#SBATCH --partition=gpu
+#SBATCH -J MGA
+#SBATCH -o logs/MGA_%j.out
+#SBATCH -e logs/MGA_%j.err
+#SBATCH --partition=simbiosyslab
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:v100-sxm2:1
-#SBATCH -t 8:00:00
-##SBATCH --export=ALL
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=10
+#SBATCH -t 48:00:00
 #SBATCH --mail-user=xing.liu@northeastern.edu
 #SBATCH --mail-type=ALL
 
-#python make_prediction.py ../data/tmp/2b4c_seqs.npz ../data/tmp/2b4c_edges.npz
-
-python run_pred.py \
-  --csv /projects/SimBioSys/Xing/MGA/data/train_set.csv \
-  --combined-seq-npz /projects/SimBioSys/Xing/MGA/data/esm_sequences_all.npz \
-  --combined-edges-npz /projects/SimBioSys/Xing/MGA/data/edges_combined_all.npz \
-  --preprocess-out-dir /projects/SimBioSys/Xing/MGA/pred_runs \
-  --scripts-dir /projects/SimBioSys/Xing/MGA/data_preprocess \
-  --sample-idx 0
+module load cuda/12.8.0
+#CUDA_VISIBLE_DEVICES=0 CUDA_LAUNCH_BLOCKING=1 python Train_model.py --out_dir checkpoints_old --num_layers 1 --num_gnn_layers 6 --num_int_layers 4
+ls iPara*pth > ipara_i_files
+python  test_cal.py ipara_i_files > ipara_i.out 

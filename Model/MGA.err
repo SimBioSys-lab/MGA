@@ -1,0 +1,3 @@
+/home/xing.liu/miniconda3/envs/msa_attention/lib/python3.12/site-packages/timm/models/layers/__init__.py:48: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+slurmstepd: error: *** JOB 7848815 ON d4070 CANCELLED AT 2026-06-24T17:04:41 ***
