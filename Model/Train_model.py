@@ -2,17 +2,14 @@
 """
 Balanced MGA/iPara training script.
 
-Suggested setup:
-  - 5-fold CV
-  - current best architecture: l1_g8_i5_do0.10_dpr0.10_lr2e-4_heads16
-  - considers both antibody and antigen during checkpoint selection
-  - selection metric = 0.5 * val_AUPR_ab + 0.5 * val_AUPR_ag
-  - saves only one checkpoint per fold
-  - no best-loss checkpoint
-  - stronger generalization settings:
-      token_drop_p = 0.02
-      dropedge = 0.02-0.08
-      aucpr_alpha = 0.30
+Fixed version:
+  - token_dropout no longer replaces residues with PAD.
+    PAD replacement can truncate chain spans because model splitting stops at PAD.
+  - default token_drop_p = 0.0.
+  - get_ab_ag_masks excludes EOC/PAD positions explicitly.
+  - warmup_epochs is now actually used with warmup + cosine LambdaLR.
+  - num_workers default remains 0 to avoid NPZ multi-worker BadZipFile issues.
+  - no tied argument is used.
 """
 
 import os
@@ -30,7 +27,7 @@ import torch.nn.functional as F
 
 from torch.utils.data import DataLoader, Subset
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import LambdaLR
 from sklearn.model_selection import KFold
 from sklearn.metrics import average_precision_score
 
@@ -79,19 +76,31 @@ def custom_collate_fn(batch):
     pads = []
     for e in edges:
         pad = -torch.ones((2, max_e), dtype=torch.long)
-        pad[:, : e.shape[0]] = e.T.clone().detach()
+        if torch.is_tensor(e):
+            ei = e.T.clone().detach().long()
+        else:
+            ei = torch.tensor(e.T, dtype=torch.long)
+        pad[:, : ei.shape[1]] = ei
         pads.append(pad)
 
     edges = torch.stack(pads)
     return edges, seqs, labels
 
 
-def get_ab_ag_masks(seqs, labels, eoc_id=24):
+def get_ab_ag_masks(seqs, labels, eoc_id=24, pad_id=1):
     """
-    Match testing split:
-      Lchain: [0, EOC0)
-      Hchain: [EOC0, EOC1)
-      Antigen: [EOC1, end)
+    Clean antibody/antigen split that explicitly excludes EOC and PAD positions.
+
+    Assumed query row layout:
+      L ... EOC H ... EOC AG1 ... [EOC AG2 ...] PAD
+
+    Masks:
+      antibody = L + H residue positions only
+      antigen  = all residue positions after the second EOC
+      valid    = labels >= 0
+
+    EOC positions are not included in antibody or antigen masks even if the label
+    file accidentally gives them a non-negative label.
     """
     B, L = labels.shape
     device = labels.device
@@ -101,16 +110,34 @@ def get_ab_ag_masks(seqs, labels, eoc_id=24):
     ag_mask = torch.zeros((B, L), dtype=torch.bool, device=device)
 
     q = seqs[:, 0, :]
+    ar = torch.arange(L, device=device)
 
     for b in range(B):
-        eocs = torch.where(q[b] == eoc_id)[0]
-        if eocs.numel() >= 2:
-            e1 = int(eocs[1].item())
-            ab_mask[b, :e1] = True
-            ag_mask[b, e1:] = True
-        else:
-            ab_mask[b, :] = True
+        pad_pos = torch.where(q[b] == pad_id)[0]
+        valid_len = int(pad_pos[0].item()) if pad_pos.numel() > 0 else L
 
+        eocs = torch.where((q[b] == eoc_id) & (ar < valid_len))[0]
+
+        if eocs.numel() >= 2:
+            e0 = int(eocs[0].item())
+            e1 = int(eocs[1].item())
+
+            # Lchain: [0, e0)
+            # Hchain: (e0, e1)
+            # Antigen: (e1, valid_len), with later EOCs excluded below.
+            ab_mask[b, :e0] = True
+            ab_mask[b, e0 + 1:e1] = True
+            ag_mask[b, e1 + 1:valid_len] = True
+        else:
+            # Fallback: treat all non-EOC, non-PAD valid positions as antibody.
+            ab_mask[b, :valid_len] = True
+
+        # Explicitly exclude EOC and PAD positions.
+        special = (q[b] == eoc_id) | (q[b] == pad_id)
+        ab_mask[b, special] = False
+        ag_mask[b, special] = False
+
+    valid = valid & (q != pad_id) & (q != eoc_id)
     ab_mask &= valid
     ag_mask &= valid
     return valid, ab_mask, ag_mask
@@ -174,16 +201,29 @@ def dropedge_padded(padded_edges, p):
     return out
 
 
-def token_dropout(seqs, labels, p, pad_id=1, eoc_id=24):
-    if p <= 0:
+def token_dropout(seqs, labels, p, pad_id=1, eoc_id=24, replace_id=None):
+    """
+    Safe token dropout.
+
+    IMPORTANT:
+      Do NOT replace residues with PAD. The model's chain splitting stops at PAD,
+      so PAD-based token dropout can truncate chains and corrupt training.
+
+    If replace_id is None, token dropout is disabled.
+    If you have a true MASK/UNK token, pass it as replace_id.
+    """
+    if p <= 0 or replace_id is None:
         return seqs
+
+    if replace_id in (pad_id, eoc_id):
+        raise ValueError(f"replace_id must not be PAD or EOC, got {replace_id}")
 
     out = seqs.clone()
     q = out[:, 0, :]
     valid = labels >= 0
     can_drop = valid & (q != pad_id) & (q != eoc_id)
     drop = (torch.rand_like(q.float()) < p) & can_drop
-    out[:, 0, :][drop] = pad_id
+    out[:, 0, :][drop] = int(replace_id)
     return out
 
 
@@ -306,9 +346,20 @@ def train_one_epoch(model, loader, optimizer, scaler, device, config, epoch, cla
         seqs = seqs.to(device, non_blocking=True).long()
         labels = labels.to(device, non_blocking=True).long()
 
-        valid_mask, ab_mask, ag_mask = get_ab_ag_masks(seqs, labels, eoc_id=config["eoc_id"])
+        valid_mask, ab_mask, ag_mask = get_ab_ag_masks(
+            seqs, labels,
+            eoc_id=config["eoc_id"],
+            pad_id=config["pad_id"],
+        )
 
-        seqs_in = token_dropout(seqs, labels, token_p, pad_id=config["pad_id"], eoc_id=config["eoc_id"])
+        seqs_in = token_dropout(
+            seqs,
+            labels,
+            token_p,
+            pad_id=config["pad_id"],
+            eoc_id=config["eoc_id"],
+            replace_id=config["token_replace_id"],
+        )
         edges_in = dropedge_padded(edges, dropedge_p)
 
         with amp_autocast(config["amp"]):
@@ -379,7 +430,11 @@ def evaluate(model, loader, device, config, class_weights):
         seqs = seqs.to(device, non_blocking=True).long()
         labels = labels.to(device, non_blocking=True).long()
 
-        valid_mask, ab_mask, ag_mask = get_ab_ag_masks(seqs, labels, eoc_id=config["eoc_id"])
+        valid_mask, ab_mask, ag_mask = get_ab_ag_masks(
+            seqs, labels,
+            eoc_id=config["eoc_id"],
+            pad_id=config["pad_id"],
+        )
 
         with amp_autocast(config["amp"]):
             logits = squeeze_logits(model(seqs, edges))
@@ -420,16 +475,55 @@ def evaluate(model, loader, device, config, class_weights):
 
 def label_stats(dataset, indices, name):
     pos = neg = ignore = 0
+    eoc_nonignore = 0
+    pad_nonignore = 0
+
     for idx in indices:
-        _, lab, _ = dataset[idx]
+        seq, lab, _ = dataset[idx]
+        seq = torch.as_tensor(seq).long()
+        q = seq[0]
         arr = np.asarray(lab)
+
         pos += int((arr == 1).sum())
         neg += int((arr == 0).sum())
         ignore += int((arr < 0).sum())
 
+        # Residue-level labels expected [L].
+        if arr.ndim == 1 and arr.shape[0] == q.numel():
+            eoc = (q.cpu().numpy() == 24)
+            pad = (q.cpu().numpy() == 1)
+            eoc_nonignore += int((arr[eoc] >= 0).sum())
+            pad_nonignore += int((arr[pad] >= 0).sum())
+
     valid = pos + neg
     frac = pos / valid if valid else 0
-    print(f"{name}: valid={valid}, pos={pos}, neg={neg}, ignore={ignore}, pos_frac={frac:.5f}")
+    print(
+        f"{name}: valid={valid}, pos={pos}, neg={neg}, ignore={ignore}, "
+        f"pos_frac={frac:.5f}, eoc_nonignore={eoc_nonignore}, pad_nonignore={pad_nonignore}"
+    )
+
+
+def make_warmup_cosine_scheduler(optimizer, config):
+    warmup_epochs = int(config["warmup_epochs"])
+    total_epochs = int(config["num_epochs"])
+    min_lr = float(config["min_lr"])
+    base_lr = float(config["learning_rate"])
+    min_factor = min_lr / base_lr if base_lr > 0 else 0.0
+
+    def lr_lambda(epoch_idx):
+        # epoch_idx starts from 0 when scheduler.step() is called after epoch 1.
+        step_epoch = epoch_idx + 1
+
+        if warmup_epochs > 0 and step_epoch <= warmup_epochs:
+            return max(min_factor, step_epoch / float(warmup_epochs))
+
+        denom = max(1, total_epochs - warmup_epochs)
+        progress = (step_epoch - warmup_epochs) / float(denom)
+        progress = min(1.0, max(0.0, progress))
+        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+        return min_factor + (1.0 - min_factor) * cosine
+
+    return LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
 def build_argparser():
@@ -445,12 +539,16 @@ def build_argparser():
     p.add_argument("--dropout", type=float, default=0.10)
     p.add_argument("--drop_path_rate", type=float, default=0.10)
     p.add_argument("--learning_rate", type=float, default=2e-4)
+    p.add_argument("--min_lr", type=float, default=5e-7)
 
     p.add_argument("--select_ab_weight", type=float, default=0.5)
     p.add_argument("--select_ag_weight", type=float, default=0.5)
 
     p.add_argument("--antibody_loss_weight", type=float, default=1.0)
     p.add_argument("--antigen_loss_weight", type=float, default=1.0)
+
+    p.add_argument("--token_drop_p", type=float, default=0.0)
+    p.add_argument("--token_replace_id", type=int, default=None)
     return p
 
 
@@ -487,6 +585,7 @@ def main():
         "early_stop": 20,
 
         "learning_rate": args.learning_rate,
+        "min_lr": args.min_lr,
         "weight_decay": 1e-4,
         "max_grad_norm": 0.5,
         "accum_steps": 1,
@@ -498,7 +597,12 @@ def main():
 
         "dropedge_min": 0.03,
         "dropedge_max": 0.10,
-        "token_drop_p": 0.03,
+
+        # IMPORTANT: keep 0 unless you have a true MASK/UNK token.
+        # Do not replace with PAD.
+        "token_drop_p": args.token_drop_p,
+        "token_replace_id": args.token_replace_id,
+
         "smooth_lambda": 0.01,
 
         "aucpr_alpha": 0.30,
@@ -557,7 +661,7 @@ def main():
             batch_size=config["batch_size"],
             shuffle=True,
             num_workers=config["num_workers"],
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available(),
             persistent_workers=(config["num_workers"] > 0),
             collate_fn=custom_collate_fn,
             drop_last=False,
@@ -568,7 +672,7 @@ def main():
             batch_size=config["batch_size"],
             shuffle=False,
             num_workers=config["num_workers"],
-            pin_memory=True,
+            pin_memory=torch.cuda.is_available(),
             persistent_workers=(config["num_workers"] > 0),
             collate_fn=custom_collate_fn,
             drop_last=False,
@@ -593,11 +697,12 @@ def main():
         set_dym_trainable(model, False)
 
         optimizer = AdamW(
-            [p for p in model.parameters() if p.requires_grad],
+            model.parameters(),
             lr=config["learning_rate"],
             weight_decay=config["weight_decay"],
         )
-        scheduler = CosineAnnealingLR(optimizer, T_max=config["num_epochs"], eta_min=5e-7)
+
+        scheduler = make_warmup_cosine_scheduler(optimizer, config)
         scaler = make_grad_scaler(enabled=config["amp"])
 
         ckpt_name = (
@@ -614,28 +719,9 @@ def main():
         dym_added = False
 
         for epoch in range(1, config["num_epochs"] + 1):
-#            if epoch == config["warmup_epochs"] + 1 and not dym_added:
-            if epoch == 5 and not dym_added:
+            if epoch == 10 and not dym_added:
                 print("Unfreezing DyM parameters.")
                 set_dym_trainable(model, True)
-
-                existing = set()
-                for group in optimizer.param_groups:
-                    for p in group["params"]:
-                        existing.add(id(p))
-
-                new_params = [
-                    p for p in model.parameters()
-                    if p.requires_grad and id(p) not in existing
-                ]
-
-                if new_params:
-                    optimizer.add_param_group({
-                        "params": new_params,
-                        "lr": config["learning_rate"],
-                        "weight_decay": config["weight_decay"],
-                    })
-
                 dym_added = True
 
             pw = config["weight_end"] + (

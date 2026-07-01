@@ -109,17 +109,16 @@ class FrozenESM2QueryFusion(nn.Module):
     """
     Frozen small ESM2 branch for the query row only.
 
-    It encodes each chain span from the query row with ESM2, projects ESM2
-    representations to embed_dim through a small adapter, and returns a
-    chain-role-scaled residual update:
+    It encodes each chain span from the query row with ESM2, then uses
+    separate adapters for each biological region:
 
-        alpha_L  * adapter(ESM2) for light-chain positions
-        alpha_H  * adapter(ESM2) for heavy-chain positions
-        alpha_AG * adapter(ESM2) for antigen-chain positions
+        alpha_L  * adapter_L(ESM2)  for light-chain positions
+        alpha_H  * adapter_H(ESM2)  for heavy-chain positions
+        alpha_AG * adapter_AG(ESM2) for antigen-chain positions
 
     The three alpha parameters are initialized to 0.0 by default, so the model
     starts exactly as the MSA-only baseline. ESM2 is frozen by default; the
-    adapter and alpha parameters are trainable.
+    three adapters and alpha parameters are trainable.
     """
     def __init__(
         self,
@@ -167,16 +166,25 @@ class FrozenESM2QueryFusion(nn.Module):
         self.eoc_id = int(eoc_id)
         self.id_to_aa = dict(DEFAULT_ID_TO_AA if id_to_aa is None else id_to_aa)
 
-        self.adapter = nn.Sequential(
-            nn.LayerNorm(esm_dim),
-            nn.Linear(esm_dim, embed_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(embed_dim, embed_dim),
-            nn.LayerNorm(embed_dim),
-        )
+        def make_adapter():
+            return nn.Sequential(
+                nn.LayerNorm(esm_dim),
+                nn.Linear(esm_dim, embed_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(embed_dim, embed_dim),
+                nn.LayerNorm(embed_dim),
+            )
 
-        # Starts as exact MSA baseline: x_query = x_query + 0 * adapter(ESM).
+        # Separate ESM adapters for each biological region. This lets the model
+        # learn different ESM feature transformations for L-chain, H-chain, and
+        # antigen, rather than forcing all regions to share one adapter and only
+        # differ by scalar alpha.
+        self.adapter_l = make_adapter()
+        self.adapter_h = make_adapter()
+        self.adapter_ag = make_adapter()
+
+        # Starts as exact MSA baseline: x_query = x_query + 0 * adapter_region(ESM).
         # Signed scalars are intentional: the model can learn to add or subtract
         # an ESM-derived direction separately for antibody and antigen regions.
         self.alpha_l = nn.Parameter(torch.tensor(float(alpha_init)))
@@ -283,26 +291,52 @@ class FrozenESM2QueryFusion(nn.Module):
 
             offset += batch_size
 
-        esm_repr = esm_repr.to(dtype=self.adapter[1].weight.dtype)
-        esm_update = self.adapter(esm_repr)
+        # Use adapter dtype. All three adapters have the same dtype by construction.
+        esm_repr = esm_repr.to(dtype=self.adapter_l[1].weight.dtype)
 
-        # Build [B, L, 1] alpha map from chain spans. All alphas start at zero,
-        # so this branch is initially exactly disabled.
-        alpha_map = torch.zeros(B, out_len, 1, device=device, dtype=esm_update.dtype)
+        # Build region masks from chain spans:
+        #   role 0 = L chain
+        #   role 1 = H chain
+        #   role 2 = antigen chain(s)
+        role_map = torch.full((B, out_len), -1, device=device, dtype=torch.long)
         for b in range(B):
             for span_idx, (start, end) in enumerate(chain_spans[b]):
                 if end <= start:
                     continue
-                role_alpha = self.alpha_l if span_idx == 0 else (self.alpha_h if span_idx == 1 else self.alpha_ag)
-                alpha_map[b, int(start):min(int(end), out_len), 0] = role_alpha.to(dtype=esm_update.dtype)
+                role_id = 0 if span_idx == 0 else (1 if span_idx == 1 else 2)
+                s = int(start)
+                e = min(int(end), out_len)
+                if e > s:
+                    role_map[b, s:e] = role_id
 
-        return alpha_map * esm_update
+        mask_l = (role_map == 0).unsqueeze(-1)
+        mask_h = (role_map == 1).unsqueeze(-1)
+        mask_ag = (role_map == 2).unsqueeze(-1)
+
+        # Separate regional adapters. Masks are necessary because adapter biases
+        # and LayerNorm can produce nonzero outputs even where esm_repr is zero.
+        update_l = self.adapter_l(esm_repr) * mask_l.to(dtype=esm_repr.dtype)
+        update_h = self.adapter_h(esm_repr) * mask_h.to(dtype=esm_repr.dtype)
+        update_ag = self.adapter_ag(esm_repr) * mask_ag.to(dtype=esm_repr.dtype)
+
+        return (
+            self.alpha_l.to(dtype=esm_repr.dtype) * update_l
+            + self.alpha_h.to(dtype=esm_repr.dtype) * update_h
+            + self.alpha_ag.to(dtype=esm_repr.dtype) * update_ag
+        )
 
     def get_alpha_values(self):
         return {
             "Lchain": float(self.alpha_l.detach().cpu().item()),
             "Hchain": float(self.alpha_h.detach().cpu().item()),
             "AGchains": float(self.alpha_ag.detach().cpu().item()),
+        }
+
+    def get_adapter_trainable_param_counts(self):
+        return {
+            "Lchain_adapter": sum(p.numel() for p in self.adapter_l.parameters() if p.requires_grad),
+            "Hchain_adapter": sum(p.numel() for p in self.adapter_h.parameters() if p.requires_grad),
+            "AGchains_adapter": sum(p.numel() for p in self.adapter_ag.parameters() if p.requires_grad),
         }
 
 

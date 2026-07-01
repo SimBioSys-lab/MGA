@@ -110,12 +110,16 @@ class FrozenESM2QueryFusion(nn.Module):
     Frozen small ESM2 branch for the query row only.
 
     It encodes each chain span from the query row with ESM2, projects ESM2
-    representations to embed_dim through a small adapter, and returns:
+    representations to embed_dim through a small adapter, and returns a
+    chain-role-scaled residual update:
 
-        alpha * adapter(ESM2(query_row_chains))
+        alpha_L  * adapter(ESM2) for light-chain positions
+        alpha_H  * adapter(ESM2) for heavy-chain positions
+        alpha_AG * adapter(ESM2) for antigen-chain positions
 
-    alpha is initialized to 0.0 by default, so the model starts exactly as the
-    MSA-only baseline. Only alpha + adapter are trainable; ESM2 is frozen.
+    The three alpha parameters are initialized to 0.0 by default, so the model
+    starts exactly as the MSA-only baseline. ESM2 is frozen by default; the
+    adapter and alpha parameters are trainable.
     """
     def __init__(
         self,
@@ -173,7 +177,11 @@ class FrozenESM2QueryFusion(nn.Module):
         )
 
         # Starts as exact MSA baseline: x_query = x_query + 0 * adapter(ESM).
-        self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
+        # Signed scalars are intentional: the model can learn to add or subtract
+        # an ESM-derived direction separately for antibody and antigen regions.
+        self.alpha_l = nn.Parameter(torch.tensor(float(alpha_init)))
+        self.alpha_h = nn.Parameter(torch.tensor(float(alpha_init)))
+        self.alpha_ag = nn.Parameter(torch.tensor(float(alpha_init)))
 
     def _tokens_to_aa(self, token_slice: torch.Tensor) -> str:
         chars = []
@@ -224,7 +232,7 @@ class FrozenESM2QueryFusion(nn.Module):
         chain_spans:  list[list[(start, end)]] from _find_chain_spans_1d
         out_len:      L
 
-        returns: [B, L, embed_dim], alpha-scaled ESM adapter output.
+        returns: [B, L, embed_dim], region-alpha-scaled ESM adapter output.
         """
         if query_tokens.dim() != 2:
             raise ValueError(f"query_tokens expected [B, L], got {tuple(query_tokens.shape)}")
@@ -238,10 +246,13 @@ class FrozenESM2QueryFusion(nn.Module):
         # Encode per-chain spans. Long chains are split into chunks to avoid ESM2
         # max-position issues.
         pieces = []
-        locations = []  # (b, abs_start, abs_end)
+        locations = []  # (b, abs_start, abs_end, role_id), role_id: 0=L, 1=H, 2=AG
 
         for b in range(B):
-            for start, end in chain_spans[b]:
+            for span_idx, (start, end) in enumerate(chain_spans[b]):
+                # By construction of your query sequence: span 0 = L chain,
+                # span 1 = H chain, span >= 2 = antigen chain(s).
+                role_id = 0 if span_idx == 0 else (1 if span_idx == 1 else 2)
                 if end <= start:
                     continue
                 cur = int(start)
@@ -253,7 +264,7 @@ class FrozenESM2QueryFusion(nn.Module):
                         pieces.append((f"b{b}_{cur}_{nxt}", aa_seq))
                         # If token conversion skipped any special token, lengths can differ.
                         # For normal chain spans this should match nxt-cur.
-                        locations.append((b, cur, cur + len(aa_seq)))
+                        locations.append((b, cur, cur + len(aa_seq), role_id))
                     cur = nxt
 
         # Process pieces one by one or in small batches. The batch size is kept
@@ -265,7 +276,7 @@ class FrozenESM2QueryFusion(nn.Module):
             sub_locs = locations[offset:offset + batch_size]
             sub_reps = self._encode_piece_batch(sub_pieces, device=device)
 
-            for rep, (b, start, end) in zip(sub_reps, sub_locs):
+            for rep, (b, start, end, role_id) in zip(sub_reps, sub_locs):
                 n = min(rep.shape[0], end - start, out_len - start)
                 if n > 0:
                     esm_repr[b, start:start + n, :] = rep[:n]
@@ -274,7 +285,25 @@ class FrozenESM2QueryFusion(nn.Module):
 
         esm_repr = esm_repr.to(dtype=self.adapter[1].weight.dtype)
         esm_update = self.adapter(esm_repr)
-        return self.alpha * esm_update
+
+        # Build [B, L, 1] alpha map from chain spans. All alphas start at zero,
+        # so this branch is initially exactly disabled.
+        alpha_map = torch.zeros(B, out_len, 1, device=device, dtype=esm_update.dtype)
+        for b in range(B):
+            for span_idx, (start, end) in enumerate(chain_spans[b]):
+                if end <= start:
+                    continue
+                role_alpha = self.alpha_l if span_idx == 0 else (self.alpha_h if span_idx == 1 else self.alpha_ag)
+                alpha_map[b, int(start):min(int(end), out_len), 0] = role_alpha.to(dtype=esm_update.dtype)
+
+        return alpha_map * esm_update
+
+    def get_alpha_values(self):
+        return {
+            "Lchain": float(self.alpha_l.detach().cpu().item()),
+            "Hchain": float(self.alpha_h.detach().cpu().item()),
+            "AGchains": float(self.alpha_ag.detach().cpu().item()),
+        }
 
 
 class Attention(nn.Module):
@@ -701,7 +730,7 @@ class CGModel(nn.Module):
         x = x[:, 0, :, :]  # [B, L, D]
 
         # Optional frozen ESM2 residual fusion into the query row.
-        # Because alpha starts at 0, this is initially exactly the MSA-only model.
+        # Because alpha_L/H/AG start at 0, this is initially exactly the MSA-only model.
         if self.use_esm and self.esm_query_fusion is not None:
             query_tokens = sequences[:, 0, :].long()
             batch_spans = [

@@ -12,6 +12,23 @@
 #SBATCH --mail-type=ALL
 
 module load cuda/12.8.0
-CUDA_VISIBLE_DEVICES=0 CUDA_LAUNCH_BLOCKING=1 python Train_model.py --out_dir checkpoints_old --num_layers 1 --num_gnn_layers 8 --num_int_layers 4
-#ls iPara*pth > ipara_i_files
-#python  test_cal.py ipara_i_files > ipara_i.out 
+
+
+
+#python check_ctsr_data_model_alignment.py \
+#  --task ss \
+#  --model-file Models_fullnew \
+#  --sequence-file para_tv_esmsequences_1600.npz \
+#  --data-file para_tv_esmss_1600.npz \
+#  --edge-file para_tv_esmedges_1600.npz \
+#  --num-classes 8 \
+#  --num-workers 0
+#
+#python check_ctsr_data_model_alignment.py \
+#  --task ctm \
+#  --model-file Models_fullnew \
+#  --sequence-file para_tv_esmsequences_1600.npz \
+#  --data-file global_maps_para_esmtv.npz \
+#  --edge-file para_tv_esmedges_1600.npz \
+#  --num-classes 2 \
+#  --num-workers 0
