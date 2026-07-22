@@ -15,20 +15,4 @@ module load cuda/12.8.0
 
 
 
-#python check_ctsr_data_model_alignment.py \
-#  --task ss \
-#  --model-file Models_fullnew \
-#  --sequence-file para_tv_esmsequences_1600.npz \
-#  --data-file para_tv_esmss_1600.npz \
-#  --edge-file para_tv_esmedges_1600.npz \
-#  --num-classes 8 \
-#  --num-workers 0
-#
-#python check_ctsr_data_model_alignment.py \
-#  --task ctm \
-#  --model-file Models_fullnew \
-#  --sequence-file para_tv_esmsequences_1600.npz \
-#  --data-file global_maps_para_esmtv.npz \
-#  --edge-file para_tv_esmedges_1600.npz \
-#  --num-classes 2 \
-#  --num-workers 0
+CUDA_VISIBLE_DEVICES=0 CUDA_LAUNCH_BLOCKING=1 python Train_model.py --out_dir checkpoints_MIPE_i --num_layers 1 --num_gnn_layers 6 --num_int_layers 3  --dropout 0.1 --drop_path_rate 0.1 --learning_rate 2e-4 

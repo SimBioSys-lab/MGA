@@ -560,9 +560,9 @@ def main():
     torch.backends.cudnn.benchmark = True
 
     config = {
-        "sequence_file": "para_tv_esmsequences_1600.npz",
-        "data_file": "para_tv_esminterfaces_1600.npz",
-        "edge_file": "para_tv_esmedges_1600.npz",
+        "sequence_file": "MIPE_tv_esmsequences_1600.npz",
+        "data_file": "MIPE_tv_esminterfaces_1600.npz",
+        "edge_file": "MIPE_tv_esmedges_1600.npz",
 
         "seq_len": 1600,
         "vocab_size": 31,
@@ -595,8 +595,8 @@ def main():
         "weight_end": 1.0,
         "weight_anneal_tau": 8.0,
 
-        "dropedge_min": 0.03,
-        "dropedge_max": 0.10,
+        "dropedge_min": 0.05,
+        "dropedge_max": 0.15,
 
         # IMPORTANT: keep 0 unless you have a true MASK/UNK token.
         # Do not replace with PAD.
@@ -606,8 +606,8 @@ def main():
         "smooth_lambda": 0.01,
 
         "aucpr_alpha": 0.30,
-        "aucpr_ramp_start": 10,
-        "aucpr_ramp_len": 10,
+        "aucpr_ramp_start": 15,
+        "aucpr_ramp_len": 15,
         "aucpr_bins": 64,
         "aucpr_temp": 0.05,
 
@@ -695,7 +695,6 @@ def main():
             print("Multiple GPUs visible; this script does not wrap DataParallel. Prefer CUDA_VISIBLE_DEVICES=0.")
 
         set_dym_trainable(model, False)
-
         optimizer = AdamW(
             model.parameters(),
             lr=config["learning_rate"],
@@ -706,7 +705,7 @@ def main():
         scaler = make_grad_scaler(enabled=config["amp"])
 
         ckpt_name = (
-            f"iPara_balanced_l{config['num_layers']}_g{config['num_gnn_layers']}_i{config['num_int_layers']}"
+            f"iMIPE_balanced_l{config['num_layers']}_g{config['num_gnn_layers']}_i{config['num_int_layers']}"
             f"_do{config['dropout']:.2f}_dpr{config['drop_path_rate']:.2f}"
             f"_lr{config['learning_rate']:.4g}_heads{config['num_heads']}_fold{fold}.pth"
         )
@@ -719,7 +718,7 @@ def main():
         dym_added = False
 
         for epoch in range(1, config["num_epochs"] + 1):
-            if epoch == 10 and not dym_added:
+            if epoch == 5 and not dym_added:
                 print("Unfreezing DyM parameters.")
                 set_dym_trainable(model, True)
                 dym_added = True

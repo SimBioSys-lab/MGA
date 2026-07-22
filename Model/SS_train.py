@@ -41,7 +41,7 @@ config = {
     "accum_steps": 1,
 
     # CV / early stop
-    "n_splits": 5,
+    "n_splits": 10,
     "early_stop": 20,
     "min_stop_epoch": 20,
 
@@ -51,8 +51,8 @@ config = {
     "use_data_parallel": True,
 
     # output
-    "output_dir": "ctsr_ss_checkpoints",
-    "prefix": "ctsr_ss",
+    "output_dir": "checkpoints_para_is",
+    "prefix": "isPara",
 }
 
 print(config)

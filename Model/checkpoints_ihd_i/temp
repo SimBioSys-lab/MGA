@@ -1,0 +1,3 @@
+for f in iMIPE*; do
+    mv -- "$f" "IHD${f:5}"
+done

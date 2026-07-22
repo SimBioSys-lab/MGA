@@ -1,22 +1,41 @@
+import argparse
+import copy
 import math
 import os
-import copy
+
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
 
+from sklearn.model_selection import KFold
 from torch.amp import autocast, GradScaler
 from torch.utils.data import DataLoader, Subset
-from sklearn.model_selection import KFold
 
 from Dataloader_ctm import SequenceParatopeDataset
 from Models_fullnew import CTMModel
 
 
-# ───────────────────────────────────────── CONFIG
+# ───────────────────────────────────────── Arguments
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Train one selected cross-validation fold."
+    )
+    parser.add_argument(
+        "--fold",
+        type=int,
+        required=True,
+        help="Fold number to train, using 1-based numbering.",
+    )
+    return parser.parse_args()
+
+
+args = parse_args()
+
+
+# ───────────────────────────────────────── Configuration
 config = {
-    # data / model
+    # Data / model
     "sequence_file": "para_tv_esmsequences_1600.npz",
     "data_file": "global_maps_para_esmtv.npz",
     "edge_file": "para_tv_esmedges_1600.npz",
@@ -31,206 +50,236 @@ config = {
     "drop_path_rate": 0.10,
     "num_classes": 2,
 
-    # optimization
+    # Optimization
     "batch_size": 4,
-    "num_epochs": 100,
+    "num_epochs": 1000,
     "warmup_epochs": 10,
-    "learning_rate": 1.0e-4,     # CTSR fine-tuning default
+    "learning_rate": 1.0e-4,
     "weight_decay": 1.0e-2,
     "max_grad_norm": 0.1,
     "accum_steps": 1,
 
-    # CV / early stop
-    "n_splits": 5,
+    # Cross-validation / early stopping
+    "n_splits": 10,
     "early_stop": 20,
     "min_stop_epoch": 20,
+    "random_seed": 42,
 
-    # optional pretrained core/model checkpoint. Use None to train from scratch.
-    "pretrained_ckpt": "isiParareg_l1_g10_i5_do0.20_dpr0.15_lr0.0001_heads16_fold4_core.pth",
-    # DataParallel support for CTSR. Manually control GPUs with CUDA_VISIBLE_DEVICES.
+    # Optional pretrained core/model checkpoint.
+    # Set to None to train from scratch.
+    "pretrained_ckpt": (
+        "isiPara_balanced_Models_fullnew_l1_g10_i5_"
+        "do0.15_dpr0.15_lr0.0001_heads16_fold8_core.pth"
+    ),
+
+    # DataParallel support.
+    # Control visible GPUs using CUDA_VISIBLE_DEVICES.
     "use_data_parallel": True,
 
-    # output
-    "output_dir": "ctsr_ctm_checkpoints",
-    "prefix": "ctsr_ctm",
+    # DataLoader
+    "num_workers": 0,
+
+    # Output
+    "output_dir": "checkpoints_para_isic",
+    "prefix": "isicPara",
 }
 
-print(config)
+
+# ───────────────────────────────────────── Validation
+if config["n_splits"] < 2:
+    raise ValueError("n_splits must be at least 2.")
+
+if not 1 <= args.fold <= config["n_splits"]:
+    raise ValueError(
+        f"--fold must be between 1 and {config['n_splits']}, "
+        f"but received {args.fold}."
+    )
+
+if config["accum_steps"] < 1:
+    raise ValueError("accum_steps must be at least 1.")
+
+selected_fold = args.fold
+
+
+# ───────────────────────────────────────── Environment setup
+print("Configuration:")
+for key, value in config.items():
+    print(f"  {key}: {value}")
+
+print(
+    f"\nSelected fold: {selected_fold}/{config['n_splits']}"
+)
+
 os.makedirs(config["output_dir"], exist_ok=True)
 
 torch.backends.cudnn.benchmark = True
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "expandable_segments:True",
+)
+
+device = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
 num_gpus = torch.cuda.device_count()
-print(f"Device: {device}; number of GPUs visible: {num_gpus}")
+
+print(
+    f"Device: {device}; "
+    f"number of GPUs visible: {num_gpus}"
+)
 
 
-# ───────────────────────────────────────── Utils
-def get_model_state_from_checkpoint(path, map_location="cpu"):
-    ckpt = torch.load(path, map_location=map_location)
+# ───────────────────────────────────────── Reproducibility
+def set_random_seed(seed):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
-    if isinstance(ckpt, dict):
-        for key in ("model_state_dict", "state_dict", "model", "model_state"):
-            if key in ckpt and isinstance(ckpt[key], dict):
-                ckpt = ckpt[key]
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+
+set_random_seed(config["random_seed"])
+
+
+# ───────────────────────────────────────── Checkpoint utilities
+def get_model_state_from_checkpoint(
+    path,
+    map_location="cpu",
+):
+    checkpoint = torch.load(
+        path,
+        map_location=map_location,
+    )
+
+    if isinstance(checkpoint, dict):
+        for key in (
+            "model_state_dict",
+            "state_dict",
+            "model",
+            "model_state",
+        ):
+            if (
+                key in checkpoint
+                and isinstance(checkpoint[key], dict)
+            ):
+                checkpoint = checkpoint[key]
                 break
 
-    if not isinstance(ckpt, dict):
-        raise TypeError(f"Checkpoint does not contain a state dict: {path}")
+    if not isinstance(checkpoint, dict):
+        raise TypeError(
+            "Checkpoint does not contain a state dictionary: "
+            f"{path}"
+        )
 
-    if len(ckpt) > 0 and next(iter(ckpt.keys())).startswith("module."):
-        ckpt = {k[len("module."):]: v for k, v in ckpt.items()}
+    if checkpoint:
+        first_key = next(iter(checkpoint.keys()))
 
-    return ckpt
+        if first_key.startswith("module."):
+            checkpoint = {
+                key[len("module."):]: value
+                for key, value in checkpoint.items()
+            }
+
+    return checkpoint
 
 
-def safe_partial_load(model, ckpt_path, device):
-    if ckpt_path is None:
+def safe_partial_load(
+    model,
+    checkpoint_path,
+    device,
+):
+    if checkpoint_path is None:
         print("No pretrained checkpoint specified.")
         return
 
-    if not os.path.exists(ckpt_path):
-        print(f"WARNING: pretrained checkpoint not found: {ckpt_path}")
+    if not os.path.exists(checkpoint_path):
+        print(
+            "WARNING: pretrained checkpoint not found: "
+            f"{checkpoint_path}"
+        )
         return
 
-    print(f"Loading pretrained checkpoint: {ckpt_path}")
-    src = get_model_state_from_checkpoint(ckpt_path, map_location=device)
-    dst = model.state_dict()
+    raw_model = (
+        model.module
+        if isinstance(model, nn.DataParallel)
+        else model
+    )
+
+    print(
+        f"Loading pretrained checkpoint: "
+        f"{checkpoint_path}"
+    )
+
+    source_state = get_model_state_from_checkpoint(
+        checkpoint_path,
+        map_location=device,
+    )
+
+    destination_state = raw_model.state_dict()
 
     loaded = {}
     skipped_shape = []
     skipped_missing = []
 
-    for k, v in src.items():
-        key = k[len("module."):] if k.startswith("module.") else k
-        if key not in dst:
-            skipped_missing.append(key)
+    for key, value in source_state.items():
+        normalized_key = (
+            key[len("module."):]
+            if key.startswith("module.")
+            else key
+        )
+
+        if normalized_key not in destination_state:
+            skipped_missing.append(normalized_key)
             continue
-        if tuple(dst[key].shape) != tuple(v.shape):
-            skipped_shape.append((key, tuple(v.shape), tuple(dst[key].shape)))
+
+        source_shape = tuple(value.shape)
+        destination_shape = tuple(
+            destination_state[normalized_key].shape
+        )
+
+        if source_shape != destination_shape:
+            skipped_shape.append(
+                (
+                    normalized_key,
+                    source_shape,
+                    destination_shape,
+                )
+            )
             continue
-        loaded[key] = v
 
-    dst.update(loaded)
-    model.load_state_dict(dst, strict=True)
+        loaded[normalized_key] = value
 
-    print(f"Loaded keys: {len(loaded)}")
-    print(f"Skipped missing keys: {len(skipped_missing)}")
-    print(f"Skipped shape-mismatch keys: {len(skipped_shape)}")
-    if skipped_missing[:10]:
-        print("First skipped missing:", skipped_missing[:10])
-    if skipped_shape[:10]:
-        print("First skipped shape mismatches:", skipped_shape[:10])
+    destination_state.update(loaded)
 
-
-def custom_collate_fn(batch):
-    sequences, contact_map, edges = zip(*batch)
-
-    sequence_tensor = torch.stack(sequences)
-    contact_map_tensor = torch.as_tensor(np.array(contact_map), dtype=torch.long)
-
-    max_edges = max(edge_index.shape[0] for edge_index in edges)
-    padded_edges = []
-
-    for edge_index in edges:
-        if torch.is_tensor(edge_index):
-            ei = edge_index.T.clone().detach().long()
-        else:
-            ei = torch.tensor(edge_index.T, dtype=torch.long)
-
-        edge_pad = -torch.ones((2, max_edges), dtype=torch.long)
-        edge_pad[:, :ei.shape[1]] = ei
-        padded_edges.append(edge_pad)
-
-    padded_edges = torch.stack(padded_edges)
-    return padded_edges, sequence_tensor, contact_map_tensor
-
-
-def make_scheduler(optimizer):
-    def lr_lambda(epoch):
-        if epoch < config["warmup_epochs"]:
-            return float(epoch + 1) / float(max(1, config["warmup_epochs"]))
-
-        denom = max(1, config["num_epochs"] - config["warmup_epochs"])
-        progress = float(epoch - config["warmup_epochs"]) / float(denom)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
-
-    return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-
-
-def forward_ctm_loss(model, edges, sequences, labels, criterion):
-    # CTMModel returns logits [B, C, L, L] and attention.
-    logits, _ = model(
-        sequences=sequences,
-        padded_edges=edges,
-        return_attention=True,
+    raw_model.load_state_dict(
+        destination_state,
+        strict=True,
     )
 
-    logits = logits.permute(0, 2, 3, 1).reshape(-1, config["num_classes"])
-    target = labels.reshape(-1)
-    return criterion(logits, target), logits.detach(), target.detach()
+    print(f"Loaded keys: {len(loaded)}")
+    print(
+        f"Skipped missing keys: "
+        f"{len(skipped_missing)}"
+    )
+    print(
+        f"Skipped shape-mismatch keys: "
+        f"{len(skipped_shape)}"
+    )
 
+    if skipped_missing[:10]:
+        print(
+            "First skipped missing keys:",
+            skipped_missing[:10],
+        )
 
-def train_one_epoch(model, loader, criterion, optimizer, scaler):
-    model.train()
-    total_loss = 0.0
-    seen = 0
-
-    optimizer.zero_grad(set_to_none=True)
-
-    for step, (edges, sequences, labels) in enumerate(loader):
-        edges = edges.to(device, non_blocking=True)
-        sequences = sequences.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-
-        if torch.isnan(labels.float()).any() or torch.isinf(labels.float()).any():
-            print("NaN/Inf found in target; skipping batch.")
-            continue
-
-        with autocast(device_type="cuda", enabled=torch.cuda.is_available()):
-            loss, _, _ = forward_ctm_loss(model, edges, sequences, labels, criterion)
-            loss = loss / config["accum_steps"]
-
-        scaler.scale(loss).backward()
-
-        if (step + 1) % config["accum_steps"] == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config["max_grad_norm"])
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad(set_to_none=True)
-
-        bs = sequences.shape[0]
-        total_loss += loss.item() * config["accum_steps"] * bs
-        seen += bs
-
-    return total_loss / max(1, seen)
-
-
-@torch.no_grad()
-def validate(model, loader, criterion):
-    model.eval()
-    total_loss = 0.0
-    seen = 0
-
-    for edges, sequences, labels in loader:
-        edges = edges.to(device, non_blocking=True)
-        sequences = sequences.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-
-        if torch.isnan(labels.float()).any() or torch.isinf(labels.float()).any():
-            print("NaN/Inf found in target; skipping batch.")
-            continue
-
-        with autocast(device_type="cuda", enabled=torch.cuda.is_available()):
-            loss, _, _ = forward_ctm_loss(model, edges, sequences, labels, criterion)
-
-        bs = sequences.shape[0]
-        total_loss += loss.item() * bs
-        seen += bs
-
-    return total_loss / max(1, seen)
+    if skipped_shape[:10]:
+        print(
+            "First skipped shape mismatches:",
+            skipped_shape[:10],
+        )
 
 
 def save_state(path, state):
@@ -238,7 +287,304 @@ def save_state(path, state):
     print(f"Saved {path}")
 
 
-# ───────────────────────────────────────── Dataset & CV
+def get_raw_model(model):
+    if isinstance(model, nn.DataParallel):
+        return model.module
+
+    return model
+
+
+# ───────────────────────────────────────── Data utilities
+def custom_collate_fn(batch):
+    sequences, contact_maps, edges = zip(*batch)
+
+    sequence_tensor = torch.stack(sequences)
+
+    contact_map_tensor = torch.as_tensor(
+        np.array(contact_maps),
+        dtype=torch.long,
+    )
+
+    max_edges = max(
+        edge_index.shape[0]
+        for edge_index in edges
+    )
+
+    padded_edges = []
+
+    for edge_index in edges:
+        if torch.is_tensor(edge_index):
+            edge_tensor = (
+                edge_index.T
+                .clone()
+                .detach()
+                .long()
+            )
+        else:
+            edge_tensor = torch.tensor(
+                edge_index.T,
+                dtype=torch.long,
+            )
+
+        edge_pad = -torch.ones(
+            (2, max_edges),
+            dtype=torch.long,
+        )
+
+        edge_pad[:, :edge_tensor.shape[1]] = (
+            edge_tensor
+        )
+
+        padded_edges.append(edge_pad)
+
+    padded_edges = torch.stack(padded_edges)
+
+    return (
+        padded_edges,
+        sequence_tensor,
+        contact_map_tensor,
+    )
+
+
+# ───────────────────────────────────────── Scheduler
+def make_scheduler(optimizer):
+    def lr_lambda(epoch):
+        if epoch < config["warmup_epochs"]:
+            return float(epoch + 1) / float(
+                max(1, config["warmup_epochs"])
+            )
+
+        denominator = max(
+            1,
+            config["num_epochs"]
+            - config["warmup_epochs"],
+        )
+
+        progress = float(
+            epoch - config["warmup_epochs"]
+        ) / float(denominator)
+
+        progress = min(max(progress, 0.0), 1.0)
+
+        return 0.5 * (
+            1.0 + math.cos(math.pi * progress)
+        )
+
+    return optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lr_lambda,
+    )
+
+
+# ───────────────────────────────────────── Loss
+def forward_ctm_loss(
+    model,
+    edges,
+    sequences,
+    labels,
+    criterion,
+):
+    # CTMModel returns:
+    # logits: [batch, classes, length, length]
+    # attention: model-specific attention output
+    logits, _ = model(
+        sequences=sequences,
+        padded_edges=edges,
+        return_attention=True,
+    )
+
+    logits = (
+        logits
+        .permute(0, 2, 3, 1)
+        .reshape(-1, config["num_classes"])
+    )
+
+    target = labels.reshape(-1)
+
+    loss = criterion(logits, target)
+
+    return (
+        loss,
+        logits.detach(),
+        target.detach(),
+    )
+
+
+# ───────────────────────────────────────── Training
+def train_one_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer,
+    scaler,
+):
+    model.train()
+
+    total_loss = 0.0
+    seen = 0
+    valid_steps = 0
+
+    optimizer.zero_grad(set_to_none=True)
+
+    for step, (
+        edges,
+        sequences,
+        labels,
+    ) in enumerate(loader):
+        edges = edges.to(
+            device,
+            non_blocking=True,
+        )
+
+        sequences = sequences.to(
+            device,
+            non_blocking=True,
+        )
+
+        labels = labels.to(
+            device,
+            non_blocking=True,
+        )
+
+        if (
+            torch.isnan(labels.float()).any()
+            or torch.isinf(labels.float()).any()
+        ):
+            print(
+                "NaN/Inf found in target; "
+                "skipping batch."
+            )
+            continue
+
+        with autocast(
+            device_type="cuda",
+            enabled=torch.cuda.is_available(),
+        ):
+            raw_loss, _, _ = forward_ctm_loss(
+                model,
+                edges,
+                sequences,
+                labels,
+                criterion,
+            )
+
+            scaled_loss = (
+                raw_loss / config["accum_steps"]
+            )
+
+        scaler.scale(scaled_loss).backward()
+
+        valid_steps += 1
+
+        should_step = (
+            valid_steps % config["accum_steps"] == 0
+        )
+
+        if should_step:
+            scaler.unscale_(optimizer)
+
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                config["max_grad_norm"],
+            )
+
+            scaler.step(optimizer)
+            scaler.update()
+
+            optimizer.zero_grad(set_to_none=True)
+
+        batch_size = sequences.shape[0]
+
+        total_loss += (
+            raw_loss.item() * batch_size
+        )
+
+        seen += batch_size
+
+    # Perform the final optimizer step when the number
+    # of valid batches is not divisible by accum_steps.
+    if (
+        valid_steps > 0
+        and valid_steps % config["accum_steps"] != 0
+    ):
+        scaler.unscale_(optimizer)
+
+        torch.nn.utils.clip_grad_norm_(
+            model.parameters(),
+            config["max_grad_norm"],
+        )
+
+        scaler.step(optimizer)
+        scaler.update()
+
+        optimizer.zero_grad(set_to_none=True)
+
+    return total_loss / max(1, seen)
+
+
+# ───────────────────────────────────────── Validation
+@torch.no_grad()
+def validate(
+    model,
+    loader,
+    criterion,
+):
+    model.eval()
+
+    total_loss = 0.0
+    seen = 0
+
+    for (
+        edges,
+        sequences,
+        labels,
+    ) in loader:
+        edges = edges.to(
+            device,
+            non_blocking=True,
+        )
+
+        sequences = sequences.to(
+            device,
+            non_blocking=True,
+        )
+
+        labels = labels.to(
+            device,
+            non_blocking=True,
+        )
+
+        if (
+            torch.isnan(labels.float()).any()
+            or torch.isinf(labels.float()).any()
+        ):
+            print(
+                "NaN/Inf found in target; "
+                "skipping validation batch."
+            )
+            continue
+
+        with autocast(
+            device_type="cuda",
+            enabled=torch.cuda.is_available(),
+        ):
+            loss, _, _ = forward_ctm_loss(
+                model,
+                edges,
+                sequences,
+                labels,
+                criterion,
+            )
+
+        batch_size = sequences.shape[0]
+
+        total_loss += loss.item() * batch_size
+        seen += batch_size
+
+    return total_loss / max(1, seen)
+
+
+# ───────────────────────────────────────── Dataset
 dataset = SequenceParatopeDataset(
     data_file=config["data_file"],
     sequence_file=config["sequence_file"],
@@ -246,108 +592,255 @@ dataset = SequenceParatopeDataset(
     max_len=config["max_len"],
 )
 
-kf = KFold(n_splits=config["n_splits"], shuffle=True, random_state=42)
+print(f"Dataset size: {len(dataset)}")
+
+if len(dataset) < config["n_splits"]:
+    raise ValueError(
+        f"Dataset contains {len(dataset)} samples, "
+        f"which is fewer than n_splits="
+        f"{config['n_splits']}."
+    )
+
+
+# ───────────────────────────────────────── Fold generation
+kfold = KFold(
+    n_splits=config["n_splits"],
+    shuffle=True,
+    random_state=config["random_seed"],
+)
+
 dataset_indices = np.arange(len(dataset))
-fold_results = []
 
+selected_train_indices = None
+selected_val_indices = None
 
-# ───────────────────────────────────────── Main loop
-for fold, (train_indices, val_indices) in enumerate(kf.split(dataset_indices), 1):
-    print(f"\nStarting Fold {fold}/{config['n_splits']}...")
+for fold, (
+    train_indices,
+    val_indices,
+) in enumerate(
+    kfold.split(dataset_indices),
+    start=1,
+):
+    if fold == selected_fold:
+        selected_train_indices = train_indices
+        selected_val_indices = val_indices
+        break
 
-    train_loader = DataLoader(
-        Subset(dataset, train_indices),
-        batch_size=config["batch_size"],
-        collate_fn=custom_collate_fn,
-        shuffle=True,
-        num_workers=2,
-        pin_memory=torch.cuda.is_available(),
+if (
+    selected_train_indices is None
+    or selected_val_indices is None
+):
+    raise RuntimeError(
+        f"Unable to construct fold {selected_fold}."
     )
 
-    val_loader = DataLoader(
-        Subset(dataset, val_indices),
-        batch_size=config["batch_size"],
-        collate_fn=custom_collate_fn,
-        shuffle=False,
-        num_workers=2,
-        pin_memory=torch.cuda.is_available(),
+print(
+    f"Fold {selected_fold}: "
+    f"{len(selected_train_indices)} training samples, "
+    f"{len(selected_val_indices)} validation samples."
+)
+
+
+# ───────────────────────────────────────── DataLoaders
+train_loader = DataLoader(
+    Subset(dataset, selected_train_indices),
+    batch_size=config["batch_size"],
+    collate_fn=custom_collate_fn,
+    shuffle=True,
+    num_workers=config["num_workers"],
+    pin_memory=torch.cuda.is_available(),
+)
+
+val_loader = DataLoader(
+    Subset(dataset, selected_val_indices),
+    batch_size=config["batch_size"],
+    collate_fn=custom_collate_fn,
+    shuffle=False,
+    num_workers=config["num_workers"],
+    pin_memory=torch.cuda.is_available(),
+)
+
+
+# ───────────────────────────────────────── Model
+model = CTMModel(
+    vocab_size=config["vocab_size"],
+    seq_len=config["max_len"],
+    embed_dim=config["embed_dim"],
+    num_heads=config["num_heads"],
+    dropout=config["dropout"],
+    num_layers=config["num_layers"],
+    num_gnn_layers=config["num_gnn_layers"],
+    num_int_layers=config["num_int_layers"],
+    drop_path_rate=config["drop_path_rate"],
+    num_classes=config["num_classes"],
+)
+
+model = model.to(device)
+
+safe_partial_load(
+    model,
+    config["pretrained_ckpt"],
+    device=device,
+)
+
+if (
+    config["use_data_parallel"]
+    and num_gpus > 1
+):
+    print(
+        f"Using {num_gpus} GPUs "
+        "with DataParallel."
     )
 
-    model = CTMModel(
-        vocab_size=config["vocab_size"],
-        seq_len=config["max_len"],
-        embed_dim=config["embed_dim"],
-        num_heads=config["num_heads"],
-        dropout=config["dropout"],
-        num_layers=config["num_layers"],
-        num_gnn_layers=config["num_gnn_layers"],
-        num_int_layers=config["num_int_layers"],
-        drop_path_rate=config["drop_path_rate"],
-        num_classes=config["num_classes"],
+    model = nn.DataParallel(model)
+
+
+# ───────────────────────────────────────── Optimization
+criterion = nn.CrossEntropyLoss(
+    ignore_index=-1
+)
+
+optimizer = optim.AdamW(
+    model.parameters(),
+    lr=config["learning_rate"],
+    weight_decay=config["weight_decay"],
+)
+
+scheduler = make_scheduler(optimizer)
+
+scaler = GradScaler(
+    enabled=torch.cuda.is_available()
+)
+
+
+# ───────────────────────────────────────── Output names
+base_name = (
+    f"{config['prefix']}"
+    f"_l{config['num_layers']}"
+    f"_g{config['num_gnn_layers']}"
+    f"_i{config['num_int_layers']}"
+    f"_do{config['dropout']:.2f}"
+    f"_dpr{config['drop_path_rate']:.2f}"
+    f"_lr{config['learning_rate']}"
+    f"_fold{selected_fold}"
+)
+
+best_model_path = os.path.join(
+    config["output_dir"],
+    base_name + "_best_val.pth",
+)
+
+final_model_path = os.path.join(
+    config["output_dir"],
+    base_name + "_final.pth",
+)
+
+
+# ───────────────────────────────────────── Main training loop
+best_val = float("inf")
+best_state = None
+best_epoch = None
+patience = 0
+
+print(
+    f"\nStarting Fold "
+    f"{selected_fold}/{config['n_splits']}..."
+)
+
+for epoch in range(config["num_epochs"]):
+    train_loss = train_one_epoch(
+        model,
+        train_loader,
+        criterion,
+        optimizer,
+        scaler,
     )
 
-    if config["use_data_parallel"] and num_gpus > 1:
-        print(f"Using {num_gpus} GPUs with DataParallel.")
-        model = nn.DataParallel(model)
-
-    model = model.to(device)
-    safe_partial_load(model, config["pretrained_ckpt"], device=device)
-
-    criterion = nn.CrossEntropyLoss(ignore_index=-1)
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=config["learning_rate"],
-        weight_decay=config["weight_decay"],
+    val_loss = validate(
+        model,
+        val_loader,
+        criterion,
     )
-    scheduler = make_scheduler(optimizer)
-    scaler = GradScaler(enabled=torch.cuda.is_available())
 
-    best_val = float("inf")
-    best_state = None
-    patience = 0
+    scheduler.step()
 
-    for epoch in range(config["num_epochs"]):
-        tr_loss = train_one_epoch(model, train_loader, criterion, optimizer, scaler)
-        val_loss = validate(model, val_loader, criterion)
+    current_lr = optimizer.param_groups[0]["lr"]
 
-        scheduler.step()
+    print(
+        f"Fold {selected_fold} "
+        f"Ep {epoch + 1:03d}/"
+        f"{config['num_epochs']} "
+        f"LR={current_lr:.2e} "
+        f"train={train_loss:.4f} "
+        f"val={val_loss:.4f}"
+    )
 
-        print(
-            f"Fold {fold} Ep {epoch + 1:03d}/{config['num_epochs']} "
-            f"LR={optimizer.param_groups[0]['lr']:.2e} "
-            f"train={tr_loss:.4f} val={val_loss:.4f}"
+    if val_loss < best_val:
+        best_val = val_loss
+        best_epoch = epoch + 1
+
+        best_state = copy.deepcopy(
+            get_raw_model(model).state_dict()
         )
 
-        if val_loss < best_val:
-            best_val = val_loss
-            best_state = copy.deepcopy(model.module.state_dict() if hasattr(model, "module") else model.state_dict())
-            patience = 0
-            print(f"New best model val loss: {best_val:.4f}")
-        else:
-            patience += 1
-            print(f"No improvement. Patience: {patience}/{config['early_stop']}")
+        patience = 0
 
-        if epoch + 1 >= config["min_stop_epoch"] and patience >= config["early_stop"]:
-            print(f"Early stopping at epoch {epoch + 1}")
-            break
+        print(
+            f"New best validation loss: "
+            f"{best_val:.4f}"
+        )
+    else:
+        patience += 1
 
-    base = (
-        f"{config['prefix']}_l{config['num_layers']}_g{config['num_gnn_layers']}"
-        f"_i{config['num_int_layers']}_do{config['dropout']:.2f}"
-        f"_dpr{config['drop_path_rate']:.2f}_lr{config['learning_rate']}"
-        f"_fold{fold}"
+        print(
+            f"No improvement. Patience: "
+            f"{patience}/"
+            f"{config['early_stop']}"
+        )
+
+    if (
+        epoch + 1 >= config["min_stop_epoch"]
+        and patience >= config["early_stop"]
+    ):
+        print(
+            f"Early stopping at epoch "
+            f"{epoch + 1}."
+        )
+        break
+
+
+# ───────────────────────────────────────── Save models
+if best_state is not None:
+    save_state(
+        best_model_path,
+        best_state,
+    )
+else:
+    print(
+        "WARNING: no best model state was recorded."
     )
 
-    if best_state is not None:
-        save_state(os.path.join(config["output_dir"], base + "_best_val.pth"), best_state)
+final_state = get_raw_model(model).state_dict()
 
-    final_state = model.module.state_dict() if hasattr(model, "module") else model.state_dict()
-    save_state(os.path.join(config["output_dir"], base + "_final.pth"), final_state)
+save_state(
+    final_model_path,
+    final_state,
+)
 
-    fold_results.append(best_val)
 
-print("\nCross-validation results:")
-for fold, val in enumerate(fold_results, 1):
-    print(f"Fold {fold}: Best Validation Loss = {val:.4f}")
-print(f"Average Validation Loss: {np.mean(fold_results):.4f}")
+# ───────────────────────────────────────── Summary
+print("\nTraining result:")
+print(
+    f"Fold: {selected_fold}/"
+    f"{config['n_splits']}"
+)
+print(
+    f"Best validation loss: "
+    f"{best_val:.4f}"
+)
 
+if best_epoch is not None:
+    print(f"Best epoch: {best_epoch}")
+
+print(f"Best model: {best_model_path}")
+print(f"Final model: {final_model_path}")

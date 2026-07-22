@@ -3,8 +3,8 @@ import torch
 # ------------------------------------------------------------------
 # 1.  Paths
 # ------------------------------------------------------------------
-in_ckpt  = "ctsr_ss_l1_g10_i5_do0.10_dpr0.10_lr0.0001_fold1_final.pth"
-out_ckpt = "ctsr_ss_l1_g10_i5_do0.10_dpr0.10_lr0.0001_fold1_final_core.pth"
+in_ckpt  = "isicPara_l1_g10_i5_do0.10_dpr0.10_lr0.0001_fold10_best_val.pth"
+out_ckpt = "isicPara_l1_g10_i5_do0.10_dpr0.10_lr0.0001_fold10_core.pth"
 
 # ------------------------------------------------------------------
 # 2.  Load full checkpoint

@@ -1,0 +1,51 @@
+====================================================================================================
+PRIMARY BEST CHECKPOINT
+====================================================================================================
+Best_For_Category                                                                          checkpoint  l  g  i     do    dpr  fold  AUC_PR  AUC_ROC  Accuracy
+         Antibody isiPara_balanced_Models_fullnew_l1_g10_i5_do0.15_dpr0.15_lr0.0001_heads16_fold1.pth  1 10  5 0.1500 0.1500     1  0.7830   0.9839    0.9703
+
+====================================================================================================
+BEST CHECKPOINT BY CATEGORY
+====================================================================================================
+Best_For_Category                                                                          checkpoint  l  g  i     do    dpr  fold  AUC_PR  AUC_ROC  Accuracy
+              All isiPara_balanced_Models_fullnew_l1_g10_i5_do0.15_dpr0.15_lr0.0001_heads16_fold8.pth  1 10  5 0.1500 0.1500     8  0.6525   0.9449    0.9403
+         Antibody isiPara_balanced_Models_fullnew_l1_g10_i5_do0.15_dpr0.15_lr0.0001_heads16_fold1.pth  1 10  5 0.1500 0.1500     1  0.7830   0.9839    0.9703
+          Antigen isiPara_balanced_Models_fullnew_l1_g10_i5_do0.15_dpr0.10_lr0.0001_heads16_fold4.pth  1 10  5 0.1500 0.1000     4  0.4662   0.8009    0.8554
+      macro_ab_ag isiPara_balanced_Models_fullnew_l1_g10_i5_do0.15_dpr0.15_lr0.0001_heads16_fold8.pth  1 10  5 0.1500 0.1500     8  0.6212   0.8900    0.9211
+
+====================================================================================================
+ANTIGEN: GROUPED BY do + dpr
+====================================================================================================
+    do    dpr  n_ckpt  mean_AUC_PR  std_AUC_PR  max_AUC_PR  mean_AUC_ROC  max_AUC_ROC
+0.1500 0.1000      10       0.4520      0.0084      0.4662        0.7971       0.8017
+0.1500 0.1500      10       0.4475      0.0093      0.4634        0.7973       0.8031
+
+====================================================================================================
+ANTIGEN: TOP FULL CONFIGS l + g + i + do + dpr
+====================================================================================================
+ l  g  i     do    dpr  n_ckpt  mean_AUC_PR  std_AUC_PR  max_AUC_PR  mean_AUC_ROC
+ 1 10  5 0.1500 0.1000      10       0.4520      0.0084      0.4662        0.7971
+ 1 10  5 0.1500 0.1500      10       0.4475      0.0093      0.4634        0.7973
+
+====================================================================================================
+ANTIGEN: GROUPED BY ARCHITECTURE l + g + i
+====================================================================================================
+ l  g  i  n_ckpt  mean_AUC_PR  std_AUC_PR  max_AUC_PR  mean_AUC_ROC
+ 1 10  5      20       0.4497      0.0089      0.4662        0.7972
+
+====================================================================================================
+ANTIBODY: GROUPED BY do + dpr
+====================================================================================================
+    do    dpr  n_ckpt  mean_AUC_PR  std_AUC_PR  max_AUC_PR  mean_AUC_ROC  max_AUC_ROC
+0.1500 0.1500      10       0.7748      0.0048      0.7830        0.9836       0.9839
+0.1500 0.1000      10       0.7734      0.0052      0.7828        0.9834       0.9838
+
+====================================================================================================
+SAVED FILES
+====================================================================================================
+result_para_isi/per_checkpoint_metrics.csv
+result_para_isi/grouped_by_config_category.csv
+result_para_isi/grouped_by_do_dpr_category.csv
+result_para_isi/grouped_by_arch_category.csv
+result_para_isi/best_checkpoints.csv
+result_para_isi/summary.txt
