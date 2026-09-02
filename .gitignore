@@ -1,4 +1,5 @@
 # Ignore error and output files
+temp/
 *.err
 *.out
 *.pth
