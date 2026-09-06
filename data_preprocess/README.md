@@ -1,50 +1,234 @@
-Preprocessing scripts for MGA
+# MGA Data Preprocessing
 
-Key scripts:
-- `data_preprocess.py`: main preprocessing utilities (generate features and labels).
-- `edge_gen.py`, `adj_gen.py`, `itf_gen.py`: helpers to build graph edges and interfaces.
-- `combine_npzs.py`: combine per-PDB NPZs into dataset-wide NPZs.
-- `run_pipeline.py` / `itf_pipeline.py`: example pipelines to run full preprocessing.
-- `requirements.txt` / `environment.yml`: dependency lists for the preprocessing environment.
+This directory contains scripts for converting antibody–antigen structures into the processed sequence, graph, and interface representations required by MGA.
 
+Pre-generated data are available from:
 
-Run the full pipeline (`run_pipeline.py`)
---------------------------------------
+**https://zenodo.org/records/22525642**
 
-`run_pipeline.py` is an end-to-end example that processes PDBs listed in a CSV and runs the full preprocessing -> MSA -> ESM seq+edges -> prediction + plot flow.
+Users who only want to run MGA with the released processed files do not need to rerun the complete preprocessing pipeline.
 
-Basic example:
+---
 
-python run_pipeline.py \
-  --pdb-dir /path/to/pdb_folder \
-  --csv /path/to/metadata.csv \
-  --hh-db-path /path/to/hhdb/Uniref30_2023_02 \
-  --scripts-dir /path/to/data_preprocess \
-  --work-dir /path/to/work_base \
-  --keep-work-dir
+## Overview
 
-CSV format
-- The CSV must include:
-  - **First column** (PDB_ID column, any name): the 4-letter PDB code
-  - **`Light_chain`**: chain letter for light chain (e.g., `L`, `B`)
-  - **`Heavy_chain`**: chain letter for heavy chain (e.g., `H`, `A`)
-  - **`ag`**: antigen chain letter(s), separated by `;` if multiple (e.g., `G`, `I`, or `G;C`)
-- Example minimal CSV (`metadata.csv`):
+```text
+PDB structure
+     │
+     ▼
+structure processing
+     ├──────────────► interface labels
+     ▼
+sequence extraction
+     ▼
+MSA generation
+     ▼
+MSA/token representation ──────────────► sequence NPZ
+     ▼
+residue graph construction ────────────► edge NPZ
+```
 
+The resulting representations can be used for training or inference.
+
+---
+
+## Important scripts
+
+- `data_preprocess.py`: general preprocessing utilities.
+- `process_pdb.py`: processes antibody–antigen PDB structures.
+- `run_hh.py`: runs HHblits to generate MSAs.
+- `seq_gen.py`: converts sequence/MSA information into MGA token representations.
+- `edge_gen.py`: constructs graph edges.
+- `adj_gen.py`: generates adjacency-related representations.
+- `itf_gen.py`: generates residue-level interface information.
+- `Extract_interface.py`: extracts antibody–antigen interface residues.
+- `combine_npzs.py`: combines per-complex NPZ files into dataset-level NPZ files.
+- `make_prediction.py`: runs MGA prediction from processed sequence and edge representations.
+- `plot_pred_from_npz.py`: generates plots from prediction output.
+
+The pretrained `.pth` model can be downloaded from:
+
+https://zenodo.org/records/22525642
+
+Before running `make_prediction.py`, set:
+
+```python
+MODEL_FILE = "/path/to/downloaded/model.pth"
+```
+
+to the local checkpoint path.
+
+---
+
+## Environment
+
+An environment specification is provided as:
+
+```text
+environment.yml
+```
+
+Create the environment with:
+
+```bash
+conda env create -f environment.yml
+```
+
+Then activate the environment specified in the YAML file.
+
+---
+
+## Input structures
+
+Input structures should be supplied as PDB files. A metadata CSV identifies the antibody and antigen chains.
+
+```csv
 pdb_code,Light_chain,Heavy_chain,ag
 4jan,B,A,I
 2b4c,L,H,G;C
+```
 
-Where to put the PDB files and CSV
-- `--pdb-dir`: point this to a directory that contains PDB files named like `<PDB_ID>.pdb` (case-insensitive: the script will try lower/upper variations). The script matches files to the first column (PDB_ID column) of your CSV.
-- If a PDB file for a `PDB_ID` is not found in `--pdb-dir`, that entry will be skipped and reported as missing.
-- `--csv`: can be anywhere on the filesystem; provide the path to your CSV file (e.g., `data/metadata.csv`).
+Required columns are:
 
-Working directories and outputs
-- By default the pipeline creates a base working directory at the parent of `--pdb-dir` and uses `tmp/<PDB_ID>` subfolders for each structure. Use `--work-dir` to override the base working directory.
-- During a run the pipeline writes per-PDB artifacts (`esm_sequences.npz`, `edges_combined.npz`, prediction CSVs, plots) into the per-PDB work folder. Use `--keep-work-dir` to keep these folders for inspection; otherwise they are deleted when the run completes.
+- `Light_chain`
+- `Heavy_chain`
+- `ag`
 
-Other notes
-- `--hh-db-path` must point to a local HHblits database (e.g., `Uniref30_2023_02`).
-- `--scripts-dir` should point to this `data_preprocess/` folder (or another folder that contains the required helper scripts such as `process_pdb.py`, `adj_gen.py`, `run_hh.py`, `seq_gen.py`, `edge_gen.py`, `make_prediction.py`, `plot_pred_from_npz.py`).
-- Inspect `run_pipeline.py` for more flags (e.g., `--esm-model-name`, `--eoc-id`).
+Multiple antigen chains can be specified using `;`, for example `G;C`.
+
+---
+
+## End-to-end preprocessing
+
+A representative workflow uses:
+
+```bash
+python run_pipeline.py \
+    --pdb-dir /path/to/pdb_folder \
+    --csv /path/to/metadata.csv \
+    --hh-db-path /path/to/Uniref30_2023_02 \
+    --scripts-dir /path/to/MGA/data_preprocess \
+    --work-dir /path/to/work_directory \
+    --keep-work-dir
+```
+
+Use:
+
+```bash
+python run_pipeline.py --help
+```
+
+to inspect the currently available arguments.
+
+---
+
+## PDB directory
+
+`--pdb-dir` should contain files corresponding to the IDs in the first column of the metadata CSV.
+
+```text
+structures/
+├── 4jan.pdb
+├── 2b4c.pdb
+└── ...
+```
+
+Missing structures are reported and skipped.
+
+---
+
+## HHblits database
+
+MSA generation requires a local HHblits database, for example:
+
+```text
+Uniref30_2023_02
+```
+
+Supply its location with:
+
+```bash
+--hh-db-path /path/to/Uniref30_2023_02
+```
+
+The HHblits database is not distributed with this repository.
+
+---
+
+## Intermediate files
+
+Depending on the selected pipeline, preprocessing can generate per-complex files such as:
+
+```text
+esm_sequences.npz
+edges_combined.npz
+```
+
+and additional sequence, interface, MSA, or graph intermediates.
+
+When `--keep-work-dir` is enabled, per-complex working directories are preserved for inspection.
+
+---
+
+## Combined NPZ files
+
+For dataset-level inference, per-complex representations can be combined using `combine_npzs.py` and supplied to `Model/run_model.py`.
+
+```bash
+python ../Model/run_model.py \
+    --csv metadata.csv \
+    --combined-seq-npz esm_sequences_all.npz \
+    --combined-edges-npz edges_combined_all.npz \
+    --preprocess-out-dir predictions \
+    --scripts-dir .
+```
+
+---
+
+## Token conventions
+
+The current MGA preprocessing and model code use:
+
+```text
+PAD token ID = 1
+EOC token ID = 24
+```
+
+The first MSA row contains the query sequence, organized approximately as:
+
+```text
+Light chain ... EOC
+Heavy chain ... EOC
+Antigen chain(s) ...
+PAD
+```
+
+EOC and PAD positions are ignored during residue-level interface evaluation.
+
+---
+
+## Pre-generated data
+
+Users who do not need to reproduce preprocessing can download the processed files directly from:
+
+https://zenodo.org/records/22525642
+
+See [`../data/README.md`](../data/README.md) for additional information.
+
+---
+
+## Prediction output
+
+`make_prediction.py` produces residue-level probabilities and labels. Typical output fields include:
+
+```text
+SampleIdx
+Key
+ChainType
+Position
+PredLabel
+Probability
+```
+
+Chain types include `Lchain`, `Hchain`, `AGchain_0`, `AGchain_1`, and additional antigen chains when present.
+
