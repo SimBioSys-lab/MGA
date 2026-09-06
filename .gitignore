@@ -2,6 +2,6 @@
 temp/
 *.err
 *.out
-*.pth
-*.npz
 *.csv
+*.npz
+*.pth
